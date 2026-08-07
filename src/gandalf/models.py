@@ -72,14 +72,12 @@ class GraderConfig(BaseModel):
     batch_timeout.
 
     clone_workspace controls whether workdir is copied before judging:
-      - True (default): each judge session runs against a fresh world-accessible
-        copy of workdir, so the judge cannot touch the graded workspace and
-        sandbox_user is guaranteed access to it.
-      - False: the judge runs directly in workdir.  Avoids copying the tree once
-        per judge session, which dominates runtime on large workspaces, but the
-        judge can then modify the workspace it is grading, and workdir must
-        already be accessible to sandbox_user (if set) since the grader will not
-        change its permissions.
+      - True (default): each session runs against a disposable world-accessible
+        copy, so the judge cannot modify the graded workspace and sandbox_user
+        is guaranteed access to it.
+      - False: the judge runs in workdir directly.  Skips a full tree copy per
+        session, but the judge can modify what it grades, and workdir must
+        already be accessible to sandbox_user.
     """
 
     model: str = "gemini/gemini-2.5-flash"
@@ -130,12 +128,8 @@ class GraderConfig(BaseModel):
 class _BaseJudgeInput(BaseModel):
     """Shared fields for all judge input types.
 
-    home_dir is where the judge keeps its own files (HOME, and therefore the
-    OpenHands SDK's ``~/.openhands`` state, plus the verdict file).  ``None``
-    means "use workdir", which is what happens when the workspace was cloned —
-    the clone is disposable, so there is nowhere better to put them.  When the
-    workspace is *not* cloned the orchestrator sets this to a temp dir so the
-    judge does not litter the real workspace.
+    home_dir is where the judge keeps its own files: HOME (and so the OpenHands
+    ``~/.openhands`` state) and the verdict file.  ``None`` means "use workdir".
     """
 
     model: str

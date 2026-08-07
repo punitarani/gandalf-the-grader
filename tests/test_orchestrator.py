@@ -1313,6 +1313,20 @@ class _BoomError(RuntimeError):
     """Sentinel error for exercising cleanup paths."""
 
 
+def write_judge_output(cmd: list[str], n: int = 1) -> subprocess.CompletedProcess[str]:
+    """Stand in for the judge subprocess: write *n* met verdicts and exit 0."""
+    output_path = cmd[cmd.index("--output") + 1]
+    pathlib.Path(output_path).write_text(
+        json.dumps(
+            {
+                "verdicts": [{"met": True, "reasoning": "ok", "evidence": []}] * n,
+                "llm_usage": {"cost_usd": 0},
+            }
+        )
+    )
+    return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+
 class TestJudgeWorkspace:
     """Tests for the judge_workspace context manager (clone and skip-clone)."""
 
@@ -1382,8 +1396,7 @@ class TestJudgeWorkspace:
 class TestRunJudgeSkipClone:
     """Tests for run_judge(clone=False) — judging in the real workspace.
 
-    The overriding requirement is that the user's workspace survives intact:
-    run_judge's cleanup must never be able to reach it.
+    The workspace must survive intact: run_judge's cleanup must never reach it.
     """
 
     @pytest.mark.usefixtures("fake_judge")
@@ -1440,16 +1453,7 @@ class TestRunJudgeSkipClone:
             captured["cwd"] = kwargs.get("cwd")
             captured["home"] = next(a[len("HOME=") :] for a in cmd if a.startswith("HOME="))
             captured["input_path"] = cmd[cmd.index("--input") + 1]
-            output_path = cmd[cmd.index("--output") + 1]
-            pathlib.Path(output_path).write_text(
-                json.dumps(
-                    {
-                        "verdicts": [{"met": True, "reasoning": "ok", "evidence": []}],
-                        "llm_usage": {"cost_usd": 0},
-                    }
-                )
-            )
-            return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+            return write_judge_output(cmd)
 
         mock_run.side_effect = capture
         judge_input = make_batch_input(tmp_path, n=1).model_copy(update={"workdir": str(workspace)})
@@ -1472,16 +1476,7 @@ class TestRunJudgeSkipClone:
         def capture(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
             with open(cmd[cmd.index("--input") + 1]) as f:
                 captured["input"] = json.load(f)
-            output_path = cmd[cmd.index("--output") + 1]
-            pathlib.Path(output_path).write_text(
-                json.dumps(
-                    {
-                        "verdicts": [{"met": True, "reasoning": "ok", "evidence": []}],
-                        "llm_usage": {"cost_usd": 0},
-                    }
-                )
-            )
-            return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+            return write_judge_output(cmd)
 
         mock_run.side_effect = capture
         judge_input = make_batch_input(tmp_path, n=1).model_copy(update={"workdir": str(workspace)})
@@ -1532,16 +1527,7 @@ class TestRunJudgeCloneDefault:
                 captured["input"] = json.load(f)
             # The clone must be a real copy the judge can see.
             captured["cloned_file"] = (pathlib.Path(captured["cwd"]) / "hello.txt").read_text()
-            output_path = cmd[cmd.index("--output") + 1]
-            pathlib.Path(output_path).write_text(
-                json.dumps(
-                    {
-                        "verdicts": [{"met": True, "reasoning": "ok", "evidence": []}],
-                        "llm_usage": {"cost_usd": 0},
-                    }
-                )
-            )
-            return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+            return write_judge_output(cmd)
 
         mock_run.side_effect = capture
         judge_input = make_batch_input(tmp_path, n=1).model_copy(update={"workdir": str(workspace)})
@@ -1550,10 +1536,10 @@ class TestRunJudgeCloneDefault:
 
         assert captured["cwd"] != str(workspace)
         assert captured["cloned_file"] == "hi"
-        # In clone mode HOME is the clone itself and home_dir stays unset.
+        # In clone mode the clone is also the scratch dir.
         assert captured["home"] == captured["cwd"]
         assert captured["input"]["workdir"] == captured["cwd"]
-        assert captured["input"]["home_dir"] is None
+        assert captured["input"]["home_dir"] == captured["cwd"]
         assert not pathlib.Path(captured["cwd"]).exists(), "clone must be removed"
         assert (workspace / "hello.txt").read_text() == "hi"
 

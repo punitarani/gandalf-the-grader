@@ -11,9 +11,8 @@ When ``batch_splits`` is set (batch mode only), criteria are split into
 positional chunks evaluated as separate batch sessions.  ``max_concurrency``
 controls the maximum number of parallel judge sessions (for both modes).
 
-Each judge session runs against a disposable copy of the workspace so it
-cannot modify the work it is grading.  Setting ``clone_workspace = false``
-skips the copy and judges the workspace in place — see ``judge_workspace``.
+Each judge session runs against a disposable copy of the workspace.  Setting
+``clone_workspace = false`` skips the copy and judges ``workdir`` in place.
 
 Produces (in ``output_dir``):
   reward.json  - Reward file ([0,1] reward)
@@ -31,7 +30,7 @@ import sys
 import tempfile
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, NamedTuple
+from typing import NamedTuple
 
 from pydantic import TypeAdapter
 
@@ -250,15 +249,13 @@ def clone_workspace(src: str) -> str:
 class JudgeDirs(NamedTuple):
     """The directories one judge subprocess runs against.
 
-    ``workdir`` is what the judge agent sees as its workspace and its cwd.
-    ``scratch`` is a world-writable directory for the judge's *own* files —
-    the input/output JSON, HOME (and so the OpenHands ``~/.openhands`` state),
-    and the verdict file.
+    ``workdir`` is the agent's workspace and cwd.  ``scratch`` is a
+    world-writable directory for the judge's own files: the input/output JSON,
+    HOME, and the verdict file.
 
-    When the workspace is cloned both are the clone: it is disposable, so there
-    is no reason to separate them.  When it is not, ``workdir`` is the user's
-    real workspace and ``scratch`` is a temp directory, keeping the judge's
-    bookkeeping out of the tree being graded.
+    Cloning makes both the clone, which is disposable.  Without it ``workdir``
+    is the user's real workspace and ``scratch`` a temp dir, keeping the
+    judge's bookkeeping out of the tree being graded.
     """
 
     workdir: str
@@ -269,8 +266,7 @@ class JudgeDirs(NamedTuple):
 def judge_workspace(src: str, *, clone: bool) -> Iterator[JudgeDirs]:
     """Prepare (and tear down) the directories for one judge subprocess.
 
-    Only directories created here are removed on exit — *src* is never touched,
-    which is what makes running without a clone safe.
+    Only directories created here are removed on exit; *src* is never touched.
     """
     if clone:
         clone_dir = clone_workspace(src)
@@ -280,8 +276,7 @@ def judge_workspace(src: str, *, clone: bool) -> Iterator[JudgeDirs]:
             shutil.rmtree(clone_dir, ignore_errors=True)
         return
 
-    # mkdtemp creates at 0o700; open it up so sandbox_user can write the
-    # verdict and output files here, exactly as clone_workspace does.
+    # mkdtemp creates at 0o700; sandbox_user must be able to write here.
     scratch = tempfile.mkdtemp(prefix="judge_scratch_")
     os.chmod(scratch, 0o777)  # noqa: S103
     try:
@@ -304,8 +299,8 @@ def run_judge(
     ``JudgeInput`` (one-element list).  On any subprocess failure every
     verdict is set to ``met=None`` with the error message.
 
-    When *clone* is False the judge runs directly in ``judge_input.workdir``
-    instead of a copy of it.  See ``judge_workspace``.
+    When *clone* is False the judge runs directly in ``judge_input.workdir``;
+    see ``judge_workspace``.
     """
     batch = isinstance(judge_input, BatchJudgeInput)
     n = len(judge_input.criteria) if isinstance(judge_input, BatchJudgeInput) else 1
@@ -313,9 +308,8 @@ def run_judge(
     def fail(msg: str) -> tuple[list[Verdict], LLMUsage]:
         return Verdict.errors(n, msg), LLMUsage()
 
-    # The stack owns every directory created below, so cleanup covers the whole
-    # body — including the NamedTemporaryFile section, which used to sit outside
-    # the try/finally and leak the clone on failure.
+    # Enter via a stack so setup failure reports cleanly, while teardown still
+    # covers the whole body below.
     stack = contextlib.ExitStack()
     try:
         dirs = stack.enter_context(judge_workspace(judge_input.workdir, clone=clone))
@@ -324,10 +318,7 @@ def run_judge(
         return fail(f"Failed to prepare judge workspace: {e}")
 
     with stack:
-        update: dict[str, Any] = {"workdir": dirs.workdir}
-        if dirs.scratch != dirs.workdir:
-            update["home_dir"] = dirs.scratch
-        resolved_input = judge_input.model_copy(update=update)
+        resolved_input = judge_input.model_copy(update={"workdir": dirs.workdir, "home_dir": dirs.scratch})
 
         prefix = "judge_batch_" if batch else "judge_"
         with tempfile.NamedTemporaryFile(
@@ -392,10 +383,9 @@ def run_judge(
             save_trace(trace_path, "", "Judge execution timed out.", -1)
             return fail("Judge execution timed out.")
         except (json.JSONDecodeError, OSError) as e:
-            # OSError also covers the subprocess itself failing to start — with
-            # clone=False the cwd is the real workspace, which sandbox_user may
-            # not be able to enter.  Without this it would escape run_judge and
-            # take down the whole run instead of erroring this criterion.
+            # OSError also covers the subprocess failing to start: with
+            # clone=False the cwd is the real workspace, which sandbox_user
+            # may not be able to enter.
             return fail(f"Judge subprocess failed: {e}")
         else:
             if batch:
@@ -756,10 +746,10 @@ def preflight_check() -> None:
 
 
 def warn_skip_clone(config: GraderConfig) -> None:
-    """Warn about the hazards of judging directly in the real workspace.
+    """Warn about the guarantees given up by ``clone_workspace = false``.
 
-    These combinations are legal — the operator may know their setup is fine —
-    but each gives up a guarantee that cloning provided, so say so out loud.
+    These setups are legal — the operator may know theirs is fine — so they
+    warn rather than fail validation.
     """
     if config.clone_workspace:
         return

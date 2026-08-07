@@ -102,9 +102,9 @@ args = ["--verbose"]
 
 ### Workspace cloning
 
-By default every judge session runs against a fresh copy of `workdir` rather than the directory itself. The copy is made world-accessible, which is what lets `sandbox_user` read the workspace, and it means the judge — which has a terminal and a file editor — cannot alter the work it is grading.
+By default every judge session runs against a fresh copy of `workdir`. The copy is made world-accessible, which is what gives `sandbox_user` access, and it means the judge — which has a terminal and a file editor — cannot alter the work it is grading.
 
-That copy is not free. It is a full recursive file copy, and it runs **once per judge session**: once per criterion in `individual` mode, once per chunk when `batch_splits` is set, and again for every retry. On a large workspace it can dominate the run.
+That copy is a full recursive file copy and it runs **once per judge session**: per criterion in `individual` mode, per chunk when `batch_splits` is set, and again for every retry. On a large workspace it can dominate the run.
 
 Setting `clone_workspace = false` skips it and points the judge at `workdir` directly:
 
@@ -113,14 +113,14 @@ workdir = "/home/agent/workspace"
 clone_workspace = false
 ```
 
-The judge's own files stay out of your workspace either way — `HOME` (and so the agent SDK's `.openhands` state), the verdict file, and the grader/judge IPC files always go to a temp directory. What you give up is the isolation itself:
+The judge's own files stay out of your workspace either way: `HOME` (and so the agent SDK's `.openhands` state), the verdict file, and the grader/judge IPC files always go to a temp directory. What you give up is the isolation:
 
-- **The judge can modify the workspace it is grading.** Nothing is read-only.
-- **Retries are no longer reproducible.** `judge_retries` re-runs errored criteria against a workspace an earlier judge session may already have written to.
+- **The judge can modify the workspace it is grading.**
+- **Retries are no longer reproducible.** `judge_retries` re-runs errored criteria against a workspace an earlier session may already have written to.
 - **Concurrent sessions share one directory.** With `max_concurrency > 1` or `batch_splits`, parallel judges can interfere with each other.
 - **`sandbox_user` gets no help.** `workdir` must already be readable and writable by that user; the grader will not change its permissions.
 
-The grader prints a warning to stderr naming whichever of these apply to your config. Skipping the clone is most attractive when the judge already runs as the current user (no `sandbox_user`) and the workspace is large.
+The grader warns on stderr about whichever of these apply to your config. Skipping the clone is most attractive when the workspace is large and the judge already runs as the current user.
 
 ### Custom Judge Prompt
 

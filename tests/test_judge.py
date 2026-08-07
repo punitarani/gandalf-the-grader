@@ -228,8 +228,11 @@ class TestMakeVerdictPath:
 
 
 class TestHomeDir:
-    """When the grader skips the clone it sends home_dir so the judge's own
-    files (HOME/.openhands, the verdict) stay out of the graded workspace."""
+    """The judge keeps its own files in home_dir, falling back to workdir.
+
+    The grader sets home_dir to a temp dir when it skips the clone, so HOME
+    (and so ~/.openhands) and the verdict stay out of the graded workspace.
+    """
 
     def _write_input(self, tmp_path: pathlib.Path, **extra: object) -> tuple[str, str]:
         input_data: dict[str, object] = {
@@ -250,20 +253,12 @@ class TestHomeDir:
         input_path, output_path = self._write_input(tmp_path, home_dir=str(scratch), **criteria)
 
         captured: dict[str, object] = {}
+        verdict = {"met": True, "reasoning": "ok", "evidence": []}
 
         def fake_make_verdict_path(prefix: str = "verdict_", directory: str | None = None) -> str:
             captured["dir"] = directory
             p = scratch / f"{prefix}test.json"
-            payload: object = (
-                [{"index": 0, "met": True, "reasoning": "ok", "evidence": []}]
-                if batch
-                else {
-                    "met": True,
-                    "reasoning": "ok",
-                    "evidence": [],
-                }
-            )
-            p.write_text(json.dumps(payload))
+            p.write_text(json.dumps([{"index": 0, **verdict}] if batch else verdict))
             return str(p)
 
         with (

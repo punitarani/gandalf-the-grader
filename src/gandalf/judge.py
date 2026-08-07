@@ -203,6 +203,7 @@ def run_agent_session(
     mcp_servers: list[MCPServer],
     workdir: str,
     prompt: str,
+    *,
     home_dir: str | None = None,
 ) -> LLMUsage:
     """Create an OpenHands agent and run a single conversation.
@@ -210,16 +211,12 @@ def run_agent_session(
     The agent writes its output to a file (path embedded in *prompt*).
     Returns LLM usage metrics (empty defaults if extraction fails).
     """
-    # Pin HOME to the judge's scratch directory before instantiating the
-    # OpenHands SDK.  The SDK writes state to ~/.openhands/ (profiles, agents,
-    # etc.) on init.  Without this, HOME may point to a directory owned by a
-    # different user (e.g. /home/agent when the judge runs as judge-sandbox via
-    # sudo), causing PermissionError on mkdir.
-    #
-    # *home_dir* is None when the grader cloned the workspace — the clone is
-    # disposable, so the workdir itself is the scratch dir.  It is a separate
-    # temp dir when the judge is running in the real workspace, which must not
-    # be littered with SDK state.
+    # Pin HOME to the judge's scratch dir before instantiating the OpenHands
+    # SDK.  The SDK writes state to ~/.openhands/ (profiles, agents, etc.) on
+    # init.  Without this, HOME may point to a directory owned by a different
+    # user (e.g. /home/agent when the judge runs as judge-sandbox via sudo),
+    # causing PermissionError on mkdir.  Defaults to workdir, which is the
+    # scratch dir when the grader cloned the workspace.
     os.environ["HOME"] = home_dir or workdir
 
     api_key = os.environ.get("LLM_API_KEY")
