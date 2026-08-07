@@ -86,6 +86,7 @@ The example uses [`gemini/gemini-2.5-flash`](examples/quickstart/grader.toml) an
 | `batch_splits` | No | | Split criteria into N chunks in batch mode (>= 2). Each chunk is evaluated as a separate batch session. Only valid with `mode = "batch"`. |
 | `max_concurrency` | No | | Max parallel judge sessions (>= 1). Defaults to 1 for individual mode, `batch_splits` for batch mode. |
 | `sandbox_user` | No | | Username for running the inner judge (via sudo). When omitted the judge runs as the current user. |
+| `clone_workspace` | No | `true` | Copy `workdir` to a temp directory before judging. Set to `false` to run the judge directly in `workdir` — see [Workspace cloning](#workspace-cloning). |
 | `judge_prompt` | No | | Inline Jinja2 template that completely overrides the built-in judge task prompt (mutually exclusive with `judge_prompt_path`) |
 | `judge_prompt_path` | No | | Path to a Jinja2 template file that completely overrides the built-in judge task prompt (mutually exclusive with `judge_prompt`) |
 
@@ -98,6 +99,28 @@ transport = "stdio"
 command = "/usr/bin/mcp-server"
 args = ["--verbose"]
 ```
+
+### Workspace cloning
+
+By default every judge session runs against a fresh copy of `workdir`. The copy is made world-accessible, which is what gives `sandbox_user` access, and it means the judge — which has a terminal and a file editor — cannot alter the work it is grading.
+
+That copy is a full recursive file copy and it runs **once per judge session**: per criterion in `individual` mode, per chunk when `batch_splits` is set, and again for every retry. On a large workspace it can dominate the run.
+
+Setting `clone_workspace = false` skips it and points the judge at `workdir` directly:
+
+```toml
+workdir = "/home/agent/workspace"
+clone_workspace = false
+```
+
+The judge's own files stay out of your workspace either way: `HOME` (and so the agent SDK's `.openhands` state), the verdict file, and the grader/judge IPC files always go to a temp directory. What you give up is the isolation:
+
+- **The judge can modify the workspace it is grading.**
+- **Retries are no longer reproducible.** `judge_retries` re-runs errored criteria against a workspace an earlier session may already have written to.
+- **Concurrent sessions share one directory.** With `max_concurrency > 1` or `batch_splits`, parallel judges can interfere with each other.
+- **`sandbox_user` gets no help.** `workdir` must already be readable and writable by that user; the grader will not change its permissions.
+
+The grader warns on stderr about whichever of these apply to your config. Skipping the clone is most attractive when the workspace is large and the judge already runs as the current user.
 
 ### Custom Judge Prompt
 

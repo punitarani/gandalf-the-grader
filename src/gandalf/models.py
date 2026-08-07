@@ -70,6 +70,14 @@ class GraderConfig(BaseModel):
     In batch mode the effective timeout per session is
     ``judge_timeout * n_criteria_in_session``, optionally capped by
     batch_timeout.
+
+    clone_workspace controls whether workdir is copied before judging:
+      - True (default): each session runs against a disposable world-accessible
+        copy, so the judge cannot modify the graded workspace and sandbox_user
+        is guaranteed access to it.
+      - False: the judge runs in workdir directly.  Skips a full tree copy per
+        session, but the judge can modify what it grades, and workdir must
+        already be accessible to sandbox_user.
     """
 
     model: str = "gemini/gemini-2.5-flash"
@@ -92,6 +100,7 @@ class GraderConfig(BaseModel):
     batch_splits: int | None = Field(default=None, ge=2)
     max_concurrency: int | None = Field(default=None, ge=1)
     judge_retries: int = 1
+    clone_workspace: bool = True
 
     @model_validator(mode="after")
     def _check_no_inline_and_path(self) -> "GraderConfig":
@@ -117,7 +126,11 @@ class GraderConfig(BaseModel):
 
 
 class _BaseJudgeInput(BaseModel):
-    """Shared fields for all judge input types."""
+    """Shared fields for all judge input types.
+
+    home_dir is where the judge keeps its own files: HOME (and so the OpenHands
+    ``~/.openhands`` state) and the verdict file.  ``None`` means "use workdir".
+    """
 
     model: str
     instructions: str
@@ -126,6 +139,7 @@ class _BaseJudgeInput(BaseModel):
     mcp_servers: list[MCPServer] = Field(default_factory=list)
     judge_guidance: str = ""
     judge_prompt: str | None = None
+    home_dir: str | None = None
 
 
 class JudgeInput(_BaseJudgeInput):

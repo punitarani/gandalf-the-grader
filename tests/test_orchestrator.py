@@ -27,6 +27,7 @@ from gandalf.orchestrator import (
     check_tmux_available,
     clone_workspace,
     judge_env_vars,
+    judge_workspace,
     main,
     preflight_check,
     resolve_instructions,
@@ -35,6 +36,7 @@ from gandalf.orchestrator import (
     run_batch_concurrent,
     run_individual,
     run_judge,
+    warn_skip_clone,
     write_info,
 )
 from tests.conftest import cr, make_batch_input, make_config
@@ -1305,6 +1307,290 @@ class TestCloneWorkspace:
             assert not (cloned / "loop_b").exists()
         finally:
             shutil.rmtree(clone_dir, ignore_errors=True)
+
+
+class _BoomError(RuntimeError):
+    """Sentinel error for exercising cleanup paths."""
+
+
+def write_judge_output(cmd: list[str], n: int = 1) -> subprocess.CompletedProcess[str]:
+    """Stand in for the judge subprocess: write *n* met verdicts and exit 0."""
+    output_path = cmd[cmd.index("--output") + 1]
+    pathlib.Path(output_path).write_text(
+        json.dumps(
+            {
+                "verdicts": [{"met": True, "reasoning": "ok", "evidence": []}] * n,
+                "llm_usage": {"cost_usd": 0},
+            }
+        )
+    )
+    return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+
+class TestJudgeWorkspace:
+    """Tests for the judge_workspace context manager (clone and skip-clone)."""
+
+    def test_clone_branch_copies_and_cleans_up(self, tmp_path: pathlib.Path) -> None:
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        (workspace / "file.txt").write_text("hello")
+
+        with judge_workspace(str(workspace), clone=True) as dirs:
+            assert dirs.workdir != str(workspace)
+            # The clone is disposable, so it doubles as the scratch dir.
+            assert dirs.scratch == dirs.workdir
+            assert (pathlib.Path(dirs.workdir) / "file.txt").read_text() == "hello"
+            clone_dir = dirs.workdir
+
+        assert not pathlib.Path(clone_dir).exists()
+        assert (workspace / "file.txt").read_text() == "hello"
+
+    def test_skip_branch_uses_src_and_a_separate_scratch(self, tmp_path: pathlib.Path) -> None:
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        (workspace / "file.txt").write_text("hello")
+
+        with judge_workspace(str(workspace), clone=False) as dirs:
+            assert dirs.workdir == str(workspace)
+            assert dirs.scratch != dirs.workdir
+            assert pathlib.Path(dirs.scratch).is_dir()
+            # sandbox_user must be able to write the verdict/output files here.
+            assert os.stat(dirs.scratch).st_mode & 0o777 == 0o777
+            scratch = dirs.scratch
+
+        assert not pathlib.Path(scratch).exists()
+
+    def test_skip_branch_never_removes_src(self, tmp_path: pathlib.Path) -> None:
+        """The real workspace must survive even when the body raises."""
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        (workspace / "file.txt").write_text("hello")
+
+        def boom() -> None:
+            with judge_workspace(str(workspace), clone=False):
+                raise _BoomError
+
+        with pytest.raises(_BoomError):
+            boom()
+
+        assert workspace.is_dir()
+        assert (workspace / "file.txt").read_text() == "hello"
+
+    def test_clone_branch_cleans_up_when_body_raises(self, tmp_path: pathlib.Path) -> None:
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        seen: dict[str, str] = {}
+
+        def boom() -> None:
+            with judge_workspace(str(workspace), clone=True) as dirs:
+                seen["clone_dir"] = dirs.workdir
+                raise _BoomError
+
+        with pytest.raises(_BoomError):
+            boom()
+
+        assert seen["clone_dir"]
+        assert not pathlib.Path(seen["clone_dir"]).exists()
+
+
+class TestRunJudgeSkipClone:
+    """Tests for run_judge(clone=False) — judging in the real workspace.
+
+    The workspace must survive intact: run_judge's cleanup must never reach it.
+    """
+
+    @pytest.mark.usefixtures("fake_judge")
+    def test_workspace_survives_and_is_unmodified(self, tmp_path: pathlib.Path) -> None:
+        """Regression: cleanup must not delete or alter the real workspace."""
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        (workspace / "hello.txt").write_text("hi")
+        (workspace / "subdir").mkdir()
+        (workspace / "subdir" / "nested.txt").write_text("world")
+
+        judge_input = make_batch_input(tmp_path, n=2).model_copy(update={"workdir": str(workspace)})
+
+        verdicts, _usage = run_judge(
+            judge_input,
+            sandbox_user=None,
+            trace_path=str(tmp_path / "trace.txt"),
+            clone=False,
+        )
+
+        assert all(v.met is True for v in verdicts)
+        assert workspace.is_dir()
+        assert (workspace / "hello.txt").read_text() == "hi"
+        assert (workspace / "subdir" / "nested.txt").read_text() == "world"
+
+    @pytest.mark.usefixtures("fake_judge")
+    def test_leaves_no_judge_files_in_the_workspace(self, tmp_path: pathlib.Path) -> None:
+        """The judge's own bookkeeping must not litter the graded workspace."""
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        (workspace / "hello.txt").write_text("hi")
+
+        judge_input = make_batch_input(tmp_path, n=1).model_copy(update={"workdir": str(workspace)})
+
+        run_judge(
+            judge_input,
+            sandbox_user=None,
+            trace_path=str(tmp_path / "trace.txt"),
+            clone=False,
+        )
+
+        assert sorted(p.name for p in workspace.iterdir()) == ["hello.txt"]
+
+    @patch("gandalf.orchestrator.clone_workspace")
+    @patch("gandalf.orchestrator.subprocess.run")
+    def test_runs_in_real_workdir_with_home_elsewhere(
+        self, mock_run: Any, mock_clone: Any, tmp_path: pathlib.Path
+    ) -> None:
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        captured: dict[str, Any] = {}
+
+        def capture(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            captured["cwd"] = kwargs.get("cwd")
+            captured["home"] = next(a[len("HOME=") :] for a in cmd if a.startswith("HOME="))
+            captured["input_path"] = cmd[cmd.index("--input") + 1]
+            return write_judge_output(cmd)
+
+        mock_run.side_effect = capture
+        judge_input = make_batch_input(tmp_path, n=1).model_copy(update={"workdir": str(workspace)})
+
+        run_judge(judge_input, sandbox_user=None, trace_path=str(tmp_path / "trace.txt"), clone=False)
+
+        assert not mock_clone.called, "clone_workspace must not run when clone=False"
+        assert captured["cwd"] == str(workspace)
+        assert captured["home"] != str(workspace), "HOME must point at the scratch dir, not the workspace"
+        # IPC files live in the scratch dir too, not the graded workspace.
+        assert not captured["input_path"].startswith(str(workspace))
+
+    @patch("gandalf.orchestrator.subprocess.run")
+    def test_home_dir_is_passed_to_the_judge(self, mock_run: Any, tmp_path: pathlib.Path) -> None:
+        """The inner judge needs home_dir so it writes its verdict outside the workspace."""
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        captured: dict[str, Any] = {}
+
+        def capture(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+            with open(cmd[cmd.index("--input") + 1]) as f:
+                captured["input"] = json.load(f)
+            return write_judge_output(cmd)
+
+        mock_run.side_effect = capture
+        judge_input = make_batch_input(tmp_path, n=1).model_copy(update={"workdir": str(workspace)})
+
+        run_judge(judge_input, sandbox_user=None, trace_path=str(tmp_path / "trace.txt"), clone=False)
+
+        assert captured["input"]["workdir"] == str(workspace)
+        assert captured["input"]["home_dir"]
+        assert captured["input"]["home_dir"] != str(workspace)
+
+    @patch("gandalf.orchestrator.subprocess.run")
+    def test_inaccessible_workdir_errors_the_criterion(self, mock_run: Any, tmp_path: pathlib.Path) -> None:
+        """A cwd the judge user cannot enter must error the criterion, not crash the run."""
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        mock_run.side_effect = PermissionError(13, "Permission denied")
+
+        judge_input = make_batch_input(tmp_path, n=2).model_copy(update={"workdir": str(workspace)})
+
+        verdicts, usage = run_judge(
+            judge_input,
+            sandbox_user="sandbox",
+            trace_path=str(tmp_path / "trace.txt"),
+            clone=False,
+        )
+
+        assert len(verdicts) == 2
+        assert all(v.met is None for v in verdicts)
+        assert "Permission denied" in verdicts[0].reasoning
+        assert usage == LLMUsage()
+        assert workspace.is_dir()
+
+
+class TestRunJudgeCloneDefault:
+    """Cloning stays the default and behaves exactly as before."""
+
+    @patch("gandalf.orchestrator.subprocess.run")
+    def test_clone_is_used_and_removed(self, mock_run: Any, tmp_path: pathlib.Path) -> None:
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        (workspace / "hello.txt").write_text("hi")
+        captured: dict[str, Any] = {}
+
+        def capture(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            captured["cwd"] = kwargs.get("cwd")
+            captured["home"] = next(a[len("HOME=") :] for a in cmd if a.startswith("HOME="))
+            with open(cmd[cmd.index("--input") + 1]) as f:
+                captured["input"] = json.load(f)
+            # The clone must be a real copy the judge can see.
+            captured["cloned_file"] = (pathlib.Path(captured["cwd"]) / "hello.txt").read_text()
+            return write_judge_output(cmd)
+
+        mock_run.side_effect = capture
+        judge_input = make_batch_input(tmp_path, n=1).model_copy(update={"workdir": str(workspace)})
+
+        run_judge(judge_input, sandbox_user=None, trace_path=str(tmp_path / "trace.txt"))
+
+        assert captured["cwd"] != str(workspace)
+        assert captured["cloned_file"] == "hi"
+        # In clone mode the clone is also the scratch dir.
+        assert captured["home"] == captured["cwd"]
+        assert captured["input"]["workdir"] == captured["cwd"]
+        assert captured["input"]["home_dir"] == captured["cwd"]
+        assert not pathlib.Path(captured["cwd"]).exists(), "clone must be removed"
+        assert (workspace / "hello.txt").read_text() == "hi"
+
+    @patch("gandalf.orchestrator.clone_workspace", side_effect=OSError("no space left on device"))
+    def test_clone_failure_errors_every_criterion(self, mock_clone: Any, tmp_path: pathlib.Path) -> None:
+        judge_input = make_batch_input(tmp_path, n=3)
+
+        verdicts, usage = run_judge(judge_input, sandbox_user=None, trace_path=str(tmp_path / "trace.txt"))
+
+        assert mock_clone.called
+        assert len(verdicts) == 3
+        assert all(v.met is None for v in verdicts)
+        assert "no space left on device" in verdicts[0].reasoning
+        assert usage == LLMUsage()
+
+
+class TestWarnSkipClone:
+    """warn_skip_clone surfaces the guarantees given up by clone_workspace=false."""
+
+    def test_silent_when_cloning(self, capsys: pytest.CaptureFixture[str]) -> None:
+        warn_skip_clone(make_config())
+        assert capsys.readouterr().err == ""
+
+    def test_base_warning_names_the_workdir(self, capsys: pytest.CaptureFixture[str]) -> None:
+        warn_skip_clone(make_config(clone_workspace=False, sandbox_user=None, workdir="/ws"))
+        stderr = capsys.readouterr().err
+        assert "clone_workspace=false" in stderr
+        assert "/ws" in stderr
+        assert "sandbox_user" not in stderr
+        assert "concurrently" not in stderr
+
+    def test_warns_about_sandbox_user(self, capsys: pytest.CaptureFixture[str]) -> None:
+        warn_skip_clone(make_config(clone_workspace=False, sandbox_user="judge-sandbox"))
+        stderr = capsys.readouterr().err
+        assert "judge-sandbox" in stderr
+        assert "will not change its permissions" in stderr
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"max_concurrency": 4},
+            {"mode": "batch", "batch_splits": 2},
+        ],
+    )
+    def test_warns_about_shared_workspace(self, overrides: dict[str, Any], capsys: pytest.CaptureFixture[str]) -> None:
+        warn_skip_clone(make_config(clone_workspace=False, **overrides))
+        assert "concurrently" in capsys.readouterr().err
+
+    def test_no_concurrency_warning_when_serial(self, capsys: pytest.CaptureFixture[str]) -> None:
+        warn_skip_clone(make_config(clone_workspace=False, max_concurrency=1))
+        assert "concurrently" not in capsys.readouterr().err
 
 
 class TestBatchRetryNegativeWeights:

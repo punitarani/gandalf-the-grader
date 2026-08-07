@@ -345,6 +345,77 @@ output_dir = "/logs/grader"
         )
         assert cfg.judge_retries == 3
 
+    def test_grader_config_clone_workspace_defaults_true(self) -> None:
+        cfg = GraderConfig(
+            instructions="test",
+            rubric_path="/rubric.json",
+            workdir="/workspace",
+            trajectory_path="/logs/trajectory.json",
+            output_dir="/logs/grader",
+        )
+        assert cfg.clone_workspace is True
+
+    def test_grader_config_clone_workspace_explicit(self) -> None:
+        cfg = GraderConfig(
+            instructions="test",
+            rubric_path="/rubric.json",
+            workdir="/workspace",
+            trajectory_path="/logs/trajectory.json",
+            output_dir="/logs/grader",
+            clone_workspace=False,
+        )
+        assert cfg.clone_workspace is False
+
+    def test_grader_config_clone_workspace_from_toml(self, tmp_path: pathlib.Path) -> None:
+        toml_content = """\
+instructions = "Do something."
+rubric_path = "/tests/rubric.json"
+workdir = "/workspace"
+trajectory_path = "/logs/trajectory.json"
+output_dir = "/logs/grader"
+clone_workspace = false
+"""
+        p = tmp_path / "grader.toml"
+        p.write_text(toml_content)
+        cfg = load_config(str(p))
+        assert cfg.clone_workspace is False
+
+    def test_grader_config_clone_workspace_omitted_from_toml(self, tmp_path: pathlib.Path) -> None:
+        toml_content = """\
+instructions = "Do something."
+rubric_path = "/tests/rubric.json"
+workdir = "/workspace"
+trajectory_path = "/logs/trajectory.json"
+output_dir = "/logs/grader"
+"""
+        p = tmp_path / "grader.toml"
+        p.write_text(toml_content)
+        cfg = load_config(str(p))
+        assert cfg.clone_workspace is True
+
+    def test_judge_input_home_dir_defaults_none(self) -> None:
+        judge_input = JudgeInput(
+            model="test-model",
+            instructions="test",
+            final_output="done",
+            criterion="check something",
+            workdir="/workspace",
+        )
+        assert judge_input.home_dir is None
+
+    def test_batch_judge_input_home_dir_roundtrips(self) -> None:
+        judge_input = BatchJudgeInput(
+            model="test-model",
+            instructions="test",
+            final_output="done",
+            criteria=["a", "b"],
+            workdir="/workspace",
+            home_dir="/scratch/judge_scratch_x",
+        )
+        restored = BatchJudgeInput.model_validate_json(judge_input.model_dump_json())
+        assert restored.home_dir == "/scratch/judge_scratch_x"
+        assert restored.workdir == "/workspace"
+
     def test_evaluation_info_errored_fields(self) -> None:
         info = EvaluationInfo(
             reward=0.5,
