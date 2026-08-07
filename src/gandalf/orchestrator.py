@@ -11,6 +11,10 @@ When ``batch_splits`` is set (batch mode only), criteria are split into
 positional chunks evaluated as separate batch sessions.  ``max_concurrency``
 controls the maximum number of parallel judge sessions (for both modes).
 
+Each judge session runs against a disposable copy of the workspace so it
+cannot modify the work it is grading.  Setting ``clone_workspace = false``
+skips the copy and judges the workspace in place — see ``judge_workspace``.
+
 Produces (in ``output_dir``):
   reward.json  - Reward file ([0,1] reward)
   info.json    - Detailed per-criterion results + LLM usage
@@ -25,7 +29,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any, NamedTuple
 
 from pydantic import TypeAdapter
 
@@ -241,17 +247,65 @@ def clone_workspace(src: str) -> str:
     return clone_dir
 
 
+class JudgeDirs(NamedTuple):
+    """The directories one judge subprocess runs against.
+
+    ``workdir`` is what the judge agent sees as its workspace and its cwd.
+    ``scratch`` is a world-writable directory for the judge's *own* files —
+    the input/output JSON, HOME (and so the OpenHands ``~/.openhands`` state),
+    and the verdict file.
+
+    When the workspace is cloned both are the clone: it is disposable, so there
+    is no reason to separate them.  When it is not, ``workdir`` is the user's
+    real workspace and ``scratch`` is a temp directory, keeping the judge's
+    bookkeeping out of the tree being graded.
+    """
+
+    workdir: str
+    scratch: str
+
+
+@contextlib.contextmanager
+def judge_workspace(src: str, *, clone: bool) -> Iterator[JudgeDirs]:
+    """Prepare (and tear down) the directories for one judge subprocess.
+
+    Only directories created here are removed on exit — *src* is never touched,
+    which is what makes running without a clone safe.
+    """
+    if clone:
+        clone_dir = clone_workspace(src)
+        try:
+            yield JudgeDirs(workdir=clone_dir, scratch=clone_dir)
+        finally:
+            shutil.rmtree(clone_dir, ignore_errors=True)
+        return
+
+    # mkdtemp creates at 0o700; open it up so sandbox_user can write the
+    # verdict and output files here, exactly as clone_workspace does.
+    scratch = tempfile.mkdtemp(prefix="judge_scratch_")
+    os.chmod(scratch, 0o777)  # noqa: S103
+    try:
+        yield JudgeDirs(workdir=src, scratch=scratch)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
 def run_judge(
     judge_input: JudgeInput | BatchJudgeInput,
     sandbox_user: str | None,
     trace_path: str,
     timeout: int = 300,
+    *,
+    clone: bool = True,
 ) -> tuple[list[Verdict], LLMUsage]:
-    """Clone workspace, run the judge subprocess, and return parsed verdicts.
+    """Prepare the workspace, run the judge subprocess, and return parsed verdicts.
 
     Always returns a *list* of verdicts, even for a single-criterion
     ``JudgeInput`` (one-element list).  On any subprocess failure every
     verdict is set to ``met=None`` with the error message.
+
+    When *clone* is False the judge runs directly in ``judge_input.workdir``
+    instead of a copy of it.  See ``judge_workspace``.
     """
     batch = isinstance(judge_input, BatchJudgeInput)
     n = len(judge_input.criteria) if isinstance(judge_input, BatchJudgeInput) else 1
@@ -259,86 +313,97 @@ def run_judge(
     def fail(msg: str) -> tuple[list[Verdict], LLMUsage]:
         return Verdict.errors(n, msg), LLMUsage()
 
+    # The stack owns every directory created below, so cleanup covers the whole
+    # body — including the NamedTemporaryFile section, which used to sit outside
+    # the try/finally and leak the clone on failure.
+    stack = contextlib.ExitStack()
     try:
-        clone_dir = clone_workspace(judge_input.workdir)
+        dirs = stack.enter_context(judge_workspace(judge_input.workdir, clone=clone))
     except Exception as e:  # noqa: BLE001
-        return fail(f"Failed to clone workspace: {e}")
+        stack.close()
+        return fail(f"Failed to prepare judge workspace: {e}")
 
-    cloned_input = judge_input.model_copy(update={"workdir": clone_dir})
+    with stack:
+        update: dict[str, Any] = {"workdir": dirs.workdir}
+        if dirs.scratch != dirs.workdir:
+            update["home_dir"] = dirs.scratch
+        resolved_input = judge_input.model_copy(update=update)
 
-    prefix = "judge_batch_" if batch else "judge_"
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        suffix=".json",
-        prefix=f"{prefix}input_",
-        dir=clone_dir,
-        delete=False,
-    ) as input_f:
-        input_f.write(cloned_input.model_dump_json())
-        input_path = input_f.name
+        prefix = "judge_batch_" if batch else "judge_"
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".json",
+            prefix=f"{prefix}input_",
+            dir=dirs.scratch,
+            delete=False,
+        ) as input_f:
+            input_f.write(resolved_input.model_dump_json())
+            input_path = input_f.name
 
-    # Pre-create the output file so sandbox_user can write to it without
-    # needing general write access to /tmp (which may not be world-writable).
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        suffix=".json",
-        prefix=f"{prefix}output_",
-        dir=clone_dir,
-        delete=False,
-    ) as output_f:
-        output_path = output_f.name
-    os.chmod(output_path, 0o666)  # noqa: S103
+        # Pre-create the output file so sandbox_user can write to it without
+        # needing general write access to /tmp (which may not be world-writable).
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".json",
+            prefix=f"{prefix}output_",
+            dir=dirs.scratch,
+            delete=False,
+        ) as output_f:
+            output_path = output_f.name
+        os.chmod(output_path, 0o666)  # noqa: S103
 
-    try:
-        os.chmod(input_path, 0o644)
-        env_vars = [f"HOME={clone_dir}", *judge_env_vars()]
+        try:
+            os.chmod(input_path, 0o644)
+            env_vars = [f"HOME={dirs.scratch}", *judge_env_vars()]
 
-        cmd = []
-        if sandbox_user is not None:
-            cmd += ["sudo", "-u", sandbox_user]
-        cmd += [
-            "env",
-            *env_vars,
-            "gandalf-the-grader-judge",
-            "--input",
-            input_path,
-            "--output",
-            output_path,
-        ]
-        if batch:
-            cmd.append("--batch")
+            cmd = []
+            if sandbox_user is not None:
+                cmd += ["sudo", "-u", sandbox_user]
+            cmd += [
+                "env",
+                *env_vars,
+                "gandalf-the-grader-judge",
+                "--input",
+                input_path,
+                "--output",
+                output_path,
+            ]
+            if batch:
+                cmd.append("--batch")
 
-        result = subprocess.run(
-            cmd,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            cwd=clone_dir,
-        )
+            result = subprocess.run(
+                cmd,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                cwd=dirs.workdir,
+            )
 
-        save_trace(trace_path, result.stdout, result.stderr, result.returncode)
+            save_trace(trace_path, result.stdout, result.stderr, result.returncode)
 
-        if result.returncode != 0:
-            return fail(f"Judge process failed (exit {result.returncode}): {result.stderr[:500]}")
+            if result.returncode != 0:
+                return fail(f"Judge process failed (exit {result.returncode}): {result.stderr[:500]}")
 
-        with open(output_path) as f:
-            data = json.load(f)
+            with open(output_path) as f:
+                data = json.load(f)
 
-    except subprocess.TimeoutExpired:
-        save_trace(trace_path, "", "Judge execution timed out.", -1)
-        return fail("Judge execution timed out.")
-    except (json.JSONDecodeError, FileNotFoundError) as e:
-        return fail(f"Failed to read judge output: {e}")
-    else:
-        if batch:
-            verdicts = TypeAdapter(list[Verdict]).validate_python(data["verdicts"])
+        except subprocess.TimeoutExpired:
+            save_trace(trace_path, "", "Judge execution timed out.", -1)
+            return fail("Judge execution timed out.")
+        except (json.JSONDecodeError, OSError) as e:
+            # OSError also covers the subprocess itself failing to start — with
+            # clone=False the cwd is the real workspace, which sandbox_user may
+            # not be able to enter.  Without this it would escape run_judge and
+            # take down the whole run instead of erroring this criterion.
+            return fail(f"Judge subprocess failed: {e}")
         else:
-            verdicts = [Verdict.model_validate(data["verdict"])]
-        usage = LLMUsage.model_validate(data["llm_usage"])
-        return verdicts, usage
-    finally:
-        shutil.rmtree(clone_dir, ignore_errors=True)
+            if batch:
+                verdicts = TypeAdapter(list[Verdict]).validate_python(data["verdicts"])
+            else:
+                verdicts = [Verdict.model_validate(data["verdict"])]
+            usage = LLMUsage.model_validate(data["llm_usage"])
+            return verdicts, usage
 
 
 def save_trace(trace_path: str, stdout: str, stderr: str, returncode: int) -> None:
@@ -406,6 +471,7 @@ def run_individual(
             sandbox_user=config.sandbox_user,
             trace_path=trace_path,
             timeout=config.judge_timeout,
+            clone=config.clone_workspace,
         )
         result = verdict_to_result(item, verdicts[0])
         print(f"  [{i + 1}/{n}] {format_status(met=verdicts[0].met)}: {verdicts[0].reasoning[:120]}")  # noqa: T201
@@ -471,6 +537,7 @@ def run_batch(
         sandbox_user=config.sandbox_user,
         trace_path=trace_path,
         timeout=batch_timeout,
+        clone=config.clone_workspace,
     )
 
     results: list[CriterionResult] = []
@@ -545,6 +612,7 @@ def run_batch_concurrent(
             sandbox_user=config.sandbox_user,
             trace_path=trace_path,
             timeout=batch_timeout,
+            clone=config.clone_workspace,
         )
 
         indexed_results: list[tuple[int, CriterionResult]] = []
@@ -687,6 +755,35 @@ def preflight_check() -> None:
     check_tmux_available()
 
 
+def warn_skip_clone(config: GraderConfig) -> None:
+    """Warn about the hazards of judging directly in the real workspace.
+
+    These combinations are legal — the operator may know their setup is fine —
+    but each gives up a guarantee that cloning provided, so say so out loud.
+    """
+    if config.clone_workspace:
+        return
+    print(  # noqa: T201
+        f"[gandalf] clone_workspace=false: the judge will run directly in {config.workdir} "
+        f"and can modify it. Grading is not reproducible across retries once the judge "
+        f"has written to the workspace.",
+        file=sys.stderr,
+    )
+    if config.sandbox_user is not None:
+        print(  # noqa: T201
+            f"[gandalf]   sandbox_user={config.sandbox_user!r} is set, but the workspace is "
+            f"not being copied — {config.workdir} must already be readable and writable by "
+            f"that user. The grader will not change its permissions.",
+            file=sys.stderr,
+        )
+    if (config.max_concurrency or 1) > 1 or config.batch_splits is not None:
+        print(  # noqa: T201
+            "[gandalf]   Multiple judge sessions will share this one directory concurrently "
+            "and can interfere with each other.",
+            file=sys.stderr,
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Grader: evaluate agent output via agent-as-judge")
     parser.add_argument("--config", required=True, help="Path to grader config TOML file")
@@ -695,6 +792,8 @@ def main() -> None:
     preflight_check()
 
     config = load_config(args.config)
+
+    warn_skip_clone(config)
 
     instructions = resolve_instructions(config)
 

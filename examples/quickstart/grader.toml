@@ -11,6 +11,10 @@
 #   (see the Configuration section of the README).
 # - `model` is any litellm-compatible identifier. `gemini/gemini-2.5-flash`
 #   requires `LLM_API_KEY` (a Gemini API key) in your environment.
+# - `workdir` is copied to a temp directory before judging, so the judge cannot
+#   modify it. Uncomment `clone_workspace` below to judge the directory in place
+#   instead — worth it on large workspaces, but the judge can then write to the
+#   workspace it is grading (see the Configuration section of the README).
 
 model = "gemini/gemini-2.5-flash"
 instructions = "Write a friendly welcome message to a text file in the workspace."
@@ -18,3 +22,4 @@ rubric_path = "examples/quickstart/rubric.json"
 workdir = "examples/quickstart/workspace"
 trajectory_path = "examples/quickstart/trajectory.json"
 output_dir = "examples/quickstart/output"
+# clone_workspace = false

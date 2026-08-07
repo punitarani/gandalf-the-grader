@@ -227,6 +227,81 @@ class TestMakeVerdictPath:
         )
 
 
+class TestHomeDir:
+    """When the grader skips the clone it sends home_dir so the judge's own
+    files (HOME/.openhands, the verdict) stay out of the graded workspace."""
+
+    def _write_input(self, tmp_path: pathlib.Path, **extra: object) -> tuple[str, str]:
+        input_data: dict[str, object] = {
+            "model": "test-model",
+            "instructions": "do a thing",
+            "final_output": "done",
+            "workdir": str(tmp_path / "workspace"),
+            **extra,
+        }
+        (tmp_path / "input.json").write_text(json.dumps(input_data))
+        return str(tmp_path / "input.json"), str(tmp_path / "output.json")
+
+    @pytest.mark.parametrize("batch", [False, True])
+    def test_verdict_goes_to_home_dir_when_set(self, tmp_path: pathlib.Path, *, batch: bool) -> None:
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+        criteria: dict[str, object] = {"criteria": ["a"]} if batch else {"criterion": "check something"}
+        input_path, output_path = self._write_input(tmp_path, home_dir=str(scratch), **criteria)
+
+        captured: dict[str, object] = {}
+
+        def fake_make_verdict_path(prefix: str = "verdict_", directory: str | None = None) -> str:
+            captured["dir"] = directory
+            p = scratch / f"{prefix}test.json"
+            payload: object = (
+                [{"index": 0, "met": True, "reasoning": "ok", "evidence": []}]
+                if batch
+                else {
+                    "met": True,
+                    "reasoning": "ok",
+                    "evidence": [],
+                }
+            )
+            p.write_text(json.dumps(payload))
+            return str(p)
+
+        with (
+            patch("gandalf.judge.make_verdict_path", side_effect=fake_make_verdict_path),
+            patch("gandalf.judge.run_agent_session", return_value=LLMUsage()) as mock_session,
+        ):
+            if batch:
+                run_judge_batch(input_path, output_path)
+            else:
+                run_judge(input_path, output_path)
+
+        assert captured["dir"] == str(scratch)
+        # The agent still works in the real workspace — only HOME moves.
+        assert mock_session.call_args.args[2] == str(tmp_path / "workspace")
+        assert mock_session.call_args.kwargs["home_dir"] == str(scratch)
+
+    def test_falls_back_to_workdir_when_unset(self, tmp_path: pathlib.Path) -> None:
+        (tmp_path / "workspace").mkdir()
+        input_path, output_path = self._write_input(tmp_path, criterion="check something")
+
+        captured: dict[str, object] = {}
+
+        def fake_make_verdict_path(prefix: str = "verdict_", directory: str | None = None) -> str:
+            captured["dir"] = directory
+            p = tmp_path / f"{prefix}test.json"
+            p.write_text(json.dumps({"met": True, "reasoning": "ok", "evidence": []}))
+            return str(p)
+
+        with (
+            patch("gandalf.judge.make_verdict_path", side_effect=fake_make_verdict_path),
+            patch("gandalf.judge.run_agent_session", return_value=LLMUsage()) as mock_session,
+        ):
+            run_judge(input_path, output_path)
+
+        assert captured["dir"] == str(tmp_path / "workspace")
+        assert mock_session.call_args.kwargs["home_dir"] == str(tmp_path / "workspace")
+
+
 class TestReadVerdict:
     def test_valid_verdict(self, tmp_path: pathlib.Path) -> None:
         p = tmp_path / "verdict.json"

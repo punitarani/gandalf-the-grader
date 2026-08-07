@@ -203,18 +203,24 @@ def run_agent_session(
     mcp_servers: list[MCPServer],
     workdir: str,
     prompt: str,
+    home_dir: str | None = None,
 ) -> LLMUsage:
     """Create an OpenHands agent and run a single conversation.
 
     The agent writes its output to a file (path embedded in *prompt*).
     Returns LLM usage metrics (empty defaults if extraction fails).
     """
-    # Pin HOME to the judge workspace before instantiating the OpenHands SDK.
-    # The SDK writes state to ~/.openhands/ (profiles, agents, etc.) on init.
-    # Without this, HOME may point to a directory owned by a different user
-    # (e.g. /home/agent when the judge runs as judge-sandbox via sudo),
-    # causing PermissionError on mkdir.
-    os.environ["HOME"] = workdir
+    # Pin HOME to the judge's scratch directory before instantiating the
+    # OpenHands SDK.  The SDK writes state to ~/.openhands/ (profiles, agents,
+    # etc.) on init.  Without this, HOME may point to a directory owned by a
+    # different user (e.g. /home/agent when the judge runs as judge-sandbox via
+    # sudo), causing PermissionError on mkdir.
+    #
+    # *home_dir* is None when the grader cloned the workspace — the clone is
+    # disposable, so the workdir itself is the scratch dir.  It is a separate
+    # temp dir when the judge is running in the real workspace, which must not
+    # be littered with SDK state.
+    os.environ["HOME"] = home_dir or workdir
 
     api_key = os.environ.get("LLM_API_KEY")
     if not api_key:
@@ -263,7 +269,8 @@ def run_judge(input_path: str, output_path: str) -> None:
     with open(input_path) as f:
         judge_input = JudgeInput.model_validate_json(f.read())
 
-    verdict_path = make_verdict_path(prefix="verdict_", directory=judge_input.workdir)
+    home = judge_input.home_dir or judge_input.workdir
+    verdict_path = make_verdict_path(prefix="verdict_", directory=home)
 
     prompt = build_judge_prompt(
         instructions=judge_input.instructions,
@@ -276,7 +283,13 @@ def run_judge(input_path: str, output_path: str) -> None:
 
     llm_usage = LLMUsage()
     try:
-        llm_usage = run_agent_session(judge_input.model, judge_input.mcp_servers, judge_input.workdir, prompt)
+        llm_usage = run_agent_session(
+            judge_input.model,
+            judge_input.mcp_servers,
+            judge_input.workdir,
+            prompt,
+            home_dir=home,
+        )
         verdict = read_verdict(verdict_path)
     except Exception as e:  # noqa: BLE001
         verdict = Verdict(met=None, reasoning=f"Judge execution error: {e}")
@@ -304,7 +317,8 @@ def run_judge_batch(input_path: str, output_path: str) -> None:
 
     n_criteria = len(judge_input.criteria)
 
-    verdict_path = make_verdict_path(prefix="verdict_batch_", directory=judge_input.workdir)
+    home = judge_input.home_dir or judge_input.workdir
+    verdict_path = make_verdict_path(prefix="verdict_batch_", directory=home)
 
     prompt = build_batch_judge_prompt(
         instructions=judge_input.instructions,
@@ -317,7 +331,13 @@ def run_judge_batch(input_path: str, output_path: str) -> None:
 
     llm_usage = LLMUsage()
     try:
-        llm_usage = run_agent_session(judge_input.model, judge_input.mcp_servers, judge_input.workdir, prompt)
+        llm_usage = run_agent_session(
+            judge_input.model,
+            judge_input.mcp_servers,
+            judge_input.workdir,
+            prompt,
+            home_dir=home,
+        )
         verdicts = read_batch_verdict(verdict_path, n_criteria)
     except Exception as e:  # noqa: BLE001
         verdicts = Verdict.errors(
